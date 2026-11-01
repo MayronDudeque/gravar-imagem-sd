@@ -362,8 +362,86 @@ def show_progress(label, completed, total, started, last_update, force=False, co
     return now
 
 
-def sha256_file(path):
+def read_partition_table(path):
+    """Lê os limites das partições em setores usando sfdisk."""
+    result = subprocess.run(
+        ["sudo", "sfdisk", "--json", str(path)],
+        text=True, capture_output=True, check=False
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        table = json.loads(result.stdout).get("partitiontable", {})
+        if table.get("unit") != "sectors":
+            return None
+        partitions = []
+        for number, item in enumerate(table.get("partitions", []), 1):
+            if "start" not in item or "size" not in item:
+                return None
+            partitions.append({
+                "number": number,
+                "start": int(item["start"]),
+                "size": int(item["size"]),
+            })
+        return partitions or None
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def update_partition_hashes(digests, partitions, chunk, chunk_start):
+    """Distribui um bloco lido entre os hashes das partições correspondentes."""
+    if not partitions:
+        return
+    chunk_end = chunk_start + len(chunk)
+    for index, partition in enumerate(partitions):
+        partition_start = partition["start"] * 512
+        partition_end = partition_start + partition["size"] * 512
+        overlap_start = max(chunk_start, partition_start)
+        overlap_end = min(chunk_end, partition_end)
+        if overlap_start < overlap_end:
+            start = overlap_start - chunk_start
+            end = overlap_end - chunk_start
+            digests[index].update(chunk[start:end])
+
+
+def partition_hash_values(digests):
+    return [digest.hexdigest() for digest in digests]
+
+
+def compare_partition_layouts(source, target):
+    if len(source) != len(target):
+        fail(
+            "A quantidade de partições do cartão não corresponde à imagem: "
+            f"{len(source)} contra {len(target)}."
+        )
+    for source_partition, target_partition in zip(source, target):
+        if (
+            source_partition["start"] != target_partition["start"]
+            or source_partition["size"] != target_partition["size"]
+        ):
+            fail(
+                "Os limites da partição "
+                f"p{source_partition['number']} não correspondem à imagem."
+            )
+
+
+def print_partition_hashes(partitions, source_hashes, target_hashes):
+    print("\nSHA-256 por partição:")
+    for partition, source_hash, target_hash in zip(partitions, source_hashes, target_hashes):
+        print(
+            f"  p{partition['number']}: "
+            f"imagem={source_hash}  cartão={target_hash}"
+        )
+        if source_hash != target_hash:
+            fail(
+                "O hash da partição "
+                f"p{partition['number']} não corresponde."
+            )
+
+
+def sha256_file(path, partitions=None):
     digest = hashlib.sha256()
+    partition_digests = [hashlib.sha256() for _ in partitions] if partitions else []
     total = path.stat().st_size
     completed = 0
     started = time.monotonic()
@@ -374,11 +452,12 @@ def sha256_file(path):
             if not chunk:
                 break
             digest.update(chunk)
+            update_partition_hashes(partition_digests, partitions, chunk, completed)
             completed += len(chunk)
             last_update = show_progress("Hash da imagem", completed, total, started, last_update)
     show_progress("Hash da imagem", completed, total, started, last_update, force=True, complete=True)
     print()
-    return digest.hexdigest()
+    return digest.hexdigest(), partition_hash_values(partition_digests)
 
 
 def write_image(image_path, device):
@@ -390,13 +469,14 @@ def write_image(image_path, device):
         fail("O dd encontrou um erro ao gravar no cartão.")
 
 
-def sha256_device(device, size):
+def sha256_device(device, size, partitions=None):
     command = [
         "sudo", "dd", f"if={device}", "bs=4M", "iflag=count_bytes",
         f"count={size}", "status=none"
     ]
     process = subprocess.Popen(command, stdout=subprocess.PIPE)
     digest = hashlib.sha256()
+    partition_digests = [hashlib.sha256() for _ in partitions] if partitions else []
     completed = 0
     started = time.monotonic()
     last_update = 0.0
@@ -406,6 +486,7 @@ def sha256_device(device, size):
             if not chunk:
                 break
             digest.update(chunk)
+            update_partition_hashes(partition_digests, partitions, chunk, completed)
             completed += len(chunk)
             last_update = show_progress(
                 "Verificação do cartão", completed, size, started, last_update
@@ -422,11 +503,11 @@ def sha256_device(device, size):
         fail("Não consegui ler os dados gravados no cartão.")
     if completed != size:
         fail(f"A leitura do cartão terminou incompleta: {completed} de {size} bytes.")
-    return digest.hexdigest()
+    return digest.hexdigest(), partition_hash_values(partition_digests)
 
 
 def main():
-    for command in ("sudo", "lsblk", "blockdev", "dd", "umount", "sync", "udevadm"):
+    for command in ("sudo", "lsblk", "blockdev", "dd", "umount", "sync", "udevadm", "sfdisk"):
         if shutil.which(command) is None:
             fail(f"Comando obrigatório não encontrado: {command}")
 
@@ -519,7 +600,13 @@ def main():
                 "somente os bytes pertencentes à imagem, não o cartão inteiro."
             )
 
-        image_hash = sha256_file(image_path)
+        source_partitions = read_partition_table(image_path)
+        if source_partitions:
+            print(f"Partições encontradas na imagem: {len(source_partitions)}")
+        else:
+            print("AVISO: não consegui ler a tabela de partições; será validado somente o hash geral.")
+
+        image_hash, image_partition_hashes = sha256_file(image_path, source_partitions)
         print(f"SHA-256 da imagem: {image_hash}")
         print(f"\nO conteúdo de {device} será apagado e substituído pela imagem.")
 
@@ -544,11 +631,25 @@ def main():
             unmount_device(device, settle=False)
             set_device_read_only(device)
 
+            target_partitions = read_partition_table(device)
+            if source_partitions:
+                if not target_partitions:
+                    fail("Não consegui ler a tabela de partições do cartão gravado.")
+                compare_partition_layouts(source_partitions, target_partitions)
+
             print("\nLendo os dados gravados para conferir o SHA-256...")
-            readback_hash = sha256_device(device, image_size)
+            readback_hash, readback_partition_hashes = sha256_device(
+                device, image_size, source_partitions
+            )
             print(f"SHA-256 no cartão: {readback_hash}")
             if readback_hash != image_hash:
                 fail(f"O hash do cartão não corresponde. A origem foi mantida em {source_path}.")
+            if source_partitions:
+                print_partition_hashes(
+                    source_partitions,
+                    image_partition_hashes,
+                    readback_partition_hashes,
+                )
         finally:
             try:
                 if write_started:
