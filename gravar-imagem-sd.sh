@@ -427,16 +427,16 @@ def compare_partition_layouts(source, target):
 
 def print_partition_hashes(partitions, source_hashes, target_hashes):
     print("\nSHA-256 por partição:")
+    mismatches = []
     for partition, source_hash, target_hash in zip(partitions, source_hashes, target_hashes):
         print(
             f"  p{partition['number']}: "
             f"imagem={source_hash}  cartão={target_hash}"
         )
         if source_hash != target_hash:
-            fail(
-                "O hash da partição "
-                f"p{partition['number']} não corresponde."
-            )
+            mismatches.append(f"p{partition['number']}")
+    if mismatches:
+        fail("Hash divergente nas partições: " + ", ".join(mismatches) + ".")
 
 
 def sha256_file(path, partitions=None):
@@ -642,14 +642,14 @@ def main():
                 device, image_size, source_partitions
             )
             print(f"SHA-256 no cartão: {readback_hash}")
-            if readback_hash != image_hash:
-                fail(f"O hash do cartão não corresponde. A origem foi mantida em {source_path}.")
             if source_partitions:
                 print_partition_hashes(
                     source_partitions,
                     image_partition_hashes,
                     readback_partition_hashes,
                 )
+            if readback_hash != image_hash:
+                fail(f"O hash do cartão não corresponde. A origem foi mantida em {source_path}.")
         finally:
             try:
                 if write_started:
